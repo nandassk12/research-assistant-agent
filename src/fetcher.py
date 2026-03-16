@@ -9,7 +9,9 @@ Semantic Scholar results use the public Graph API via ``requests``.
 """
 
 import logging
+import os
 import time
+import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
 
 import arxiv
@@ -31,6 +33,23 @@ SS_TIMEOUT: int = 15                     # seconds
 SS_INITIAL_BACKOFF: float = 2.0         # seconds for first 429 retry
 SS_MAX_RETRY: int = 4
 SS_BACKOFF_FACTOR: float = 2.0          # exponential multiplier
+
+# ── OpenAlex ───────────────────────────────────────────────────────────────
+OPENALEX_API_URL: str = "https://api.openalex.org/works"
+OPENALEX_FIELDS: str = (
+    "title,abstract_inverted_index,authorships,"
+    "publication_year,doi,primary_location,cited_by_count,concepts"
+)
+OPENALEX_DELAY: float = 1.0
+
+# ── PubMed ─────────────────────────────────────────────────────────────────
+PUBMED_SEARCH_URL: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+PUBMED_FETCH_URL: str  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+PUBMED_DELAY: float = 0.5
+
+# ── CORE ───────────────────────────────────────────────────────────────────
+CORE_API_URL: str = "https://api.core.ac.uk/v3/search/works"
+CORE_API_KEY: str = os.getenv("CORE_API_KEY", "")
 
 # ── Combined fetch thresholds ──────────────────────────────────────────────
 ARXIV_MIN_RESULTS_BEFORE_SS: int = 5   # if arXiv returns fewer, also use SS
@@ -260,18 +279,333 @@ def fetch_semantic_scholar(query: str, max_results: int = 10) -> List[Dict[str, 
     return []
 
 
+def fetch_openalex(query: str, max_results: int = 10) -> List[Dict[str, Any]]:
+    """
+    Fetch open-access research papers from the OpenAlex API.
+
+    Decodes the ``abstract_inverted_index`` format returned by the API
+    into a plain text abstract string.
+
+    Parameters
+    ----------
+    query : str
+        Search query string.
+    max_results : int, optional
+        Maximum number of results to request (default 10).
+
+    Returns
+    -------
+    list of dict
+        Each dict contains: ``title``, ``abstract``, ``authors``, ``year``,
+        ``url``, ``source`` (``"openalex"``), ``id``, ``citations``,
+        ``topics``.  Returns ``[]`` on any failure.
+    """
+    if not isinstance(query, str) or not query.strip():
+        logger.warning("fetch_openalex: empty query received.")
+        return []
+
+    try:
+        params: Dict[str, Any] = {
+            "search":   query.strip(),
+            "per_page": max_results,
+            "filter":   "is_oa:true",
+            "select":   OPENALEX_FIELDS,
+        }
+        resp = requests.get(
+            OPENALEX_API_URL,
+            params=params,
+            headers=REQUEST_HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+
+        papers: List[Dict[str, Any]] = []
+        for item in results:
+            # ── Title ────────────────────────────────────────────────────────
+            title = _safe_str(item.get("title"))
+            if not title:
+                continue
+
+            # ── Abstract — decode inverted index ──────────────────────────
+            abstract = ""
+            inv = item.get("abstract_inverted_index") or {}
+            if inv:
+                try:
+                    pos_word: Dict[int, str] = {}
+                    for word, positions in inv.items():
+                        for pos in positions:
+                            pos_word[pos] = word
+                    abstract = " ".join(pos_word[i] for i in sorted(pos_word))
+                except Exception:
+                    abstract = ""
+
+            # ── Authors ─────────────────────────────────────────────────────
+            authors: List[str] = []
+            for ship in item.get("authorships") or []:
+                name = (ship.get("author") or {}).get("display_name", "")
+                if name:
+                    authors.append(_safe_str(name))
+
+            # ── Year ────────────────────────────────────────────────────────
+            year = _safe_str(item.get("publication_year"))
+
+            # ── URL: prefer landing page, fall back to DOI ───────────────
+            loc = item.get("primary_location") or {}
+            url = _safe_str(loc.get("landing_page_url"))
+            if not url:
+                doi = _safe_str(item.get("doi"))
+                url = f"https://doi.org/{doi}" if doi else ""
+
+            # ── Topics from concepts ────────────────────────────────────────
+            topics: List[str] = [
+                _safe_str(c.get("display_name"))
+                for c in (item.get("concepts") or [])[:5]
+                if c.get("display_name")
+            ]
+
+            papers.append({
+                "title":     title,
+                "abstract":  abstract,
+                "authors":   authors,
+                "year":      year,
+                "url":       url,
+                "source":    "openalex",
+                "id":        _safe_str(item.get("id")),
+                "citations": item.get("cited_by_count", 0),
+                "topics":    topics,
+            })
+
+        time.sleep(OPENALEX_DELAY)
+        logger.info("fetch_openalex: retrieved %d paper(s) for query '%s'.", len(papers), query)
+        return papers
+
+    except Exception as exc:
+        logger.error("fetch_openalex: failed — %s", exc)
+        return []
+
+
+def fetch_pubmed(query: str, max_results: int = 10) -> List[Dict[str, Any]]:
+    """
+    Fetch research papers from NCBI PubMed via the Entrez eUtils API.
+
+    Two-step process: search for PMIDs then fetch full XML records.
+
+    Parameters
+    ----------
+    query : str
+        Search query string.
+    max_results : int, optional
+        Maximum number of results to request (default 10).
+
+    Returns
+    -------
+    list of dict
+        Each dict contains: ``title``, ``abstract``, ``authors``, ``year``,
+        ``url``, ``source`` (``"pubmed"``), ``id``.
+        Returns ``[]`` on any failure.
+    """
+    if not isinstance(query, str) or not query.strip():
+        logger.warning("fetch_pubmed: empty query received.")
+        return []
+
+    try:
+        # ── Step 1: search for PubMed IDs ─────────────────────────────────
+        search_resp = requests.get(
+            PUBMED_SEARCH_URL,
+            params={
+                "db":      "pubmed",
+                "term":    query.strip(),
+                "retmax":  max_results,
+                "retmode": "json",
+            },
+            headers=REQUEST_HEADERS,
+            timeout=15,
+        )
+        search_resp.raise_for_status()
+        id_list: List[str] = (
+            search_resp.json()
+            .get("esearchresult", {})
+            .get("idlist", [])
+        )
+        if not id_list:
+            logger.info("fetch_pubmed: no IDs found for query '%s'.", query)
+            return []
+
+        time.sleep(PUBMED_DELAY)
+
+        # ── Step 2: fetch full XML records ────────────────────────────────
+        fetch_resp = requests.get(
+            PUBMED_FETCH_URL,
+            params={
+                "db":      "pubmed",
+                "id":      ",".join(id_list),
+                "retmode": "xml",
+                "rettype": "abstract",
+            },
+            headers=REQUEST_HEADERS,
+            timeout=20,
+        )
+        fetch_resp.raise_for_status()
+
+        # ── Step 3: parse XML ─────────────────────────────────────────────
+        root = ET.fromstring(fetch_resp.content)
+        papers: List[Dict[str, Any]] = []
+
+        for article in root.findall(".//PubmedArticle"):
+            try:
+                med = article.find("MedlineCitation")
+                if med is None:
+                    continue
+                art = med.find("Article")
+                if art is None:
+                    continue
+
+                # Title
+                title_el = art.find("ArticleTitle")
+                title = _safe_str(title_el.text if title_el is not None else "")
+                if not title:
+                    continue
+
+                # Abstract
+                abstract_el = art.find(".//AbstractText")
+                abstract = _safe_str(abstract_el.text if abstract_el is not None else "")
+
+                # Authors
+                authors: List[str] = []
+                for au in art.findall(".//Author"):
+                    last  = au.findtext("LastName", "").strip()
+                    first = au.findtext("ForeName", "").strip()
+                    name  = f"{first} {last}".strip()
+                    if name:
+                        authors.append(name)
+
+                # Year
+                year = ""
+                pub_date = art.find(".//PubDate")
+                if pub_date is not None:
+                    year = _safe_str(pub_date.findtext("Year", ""))
+
+                # PMID
+                pmid_el = med.find("PMID")
+                pmid    = _safe_str(pmid_el.text if pmid_el is not None else "")
+                url     = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""
+
+                papers.append({
+                    "title":    title,
+                    "abstract": abstract,
+                    "authors":  authors,
+                    "year":     year,
+                    "url":      url,
+                    "source":   "pubmed",
+                    "id":       pmid,
+                })
+            except Exception as parse_exc:
+                logger.warning("fetch_pubmed: skipped a record — %s", parse_exc)
+                continue
+
+        logger.info("fetch_pubmed: retrieved %d paper(s) for query '%s'.", len(papers), query)
+        return papers
+
+    except Exception as exc:
+        logger.error("fetch_pubmed: failed — %s", exc)
+        return []
+
+
+def fetch_core(query: str, max_results: int = 10) -> List[Dict[str, Any]]:
+    """
+    Fetch open-access papers from the CORE API (v3).
+
+    Requires a ``CORE_API_KEY`` environment variable.  If the key is absent
+    a warning is logged and an empty list is returned immediately.
+
+    Parameters
+    ----------
+    query : str
+        Search query string.
+    max_results : int, optional
+        Maximum number of results to request (default 10).
+
+    Returns
+    -------
+    list of dict
+        Each dict contains: ``title``, ``abstract``, ``authors``, ``year``,
+        ``url``, ``source`` (``"core"``), ``id``, ``full_text``.
+        Returns ``[]`` on any failure or missing API key.
+    """
+    if not isinstance(query, str) or not query.strip():
+        logger.warning("fetch_core: empty query received.")
+        return []
+
+    if not CORE_API_KEY:
+        logger.warning(
+            "fetch_core: CORE_API_KEY not set — skipping CORE source. "
+            "Add CORE_API_KEY to your .env file to enable it."
+        )
+        return []
+
+    try:
+        resp = requests.get(
+            CORE_API_URL,
+            params={"q": query.strip(), "limit": max_results},
+            headers={
+                **REQUEST_HEADERS,
+                "Authorization": f"Bearer {CORE_API_KEY}",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+
+        papers: List[Dict[str, Any]] = []
+        for item in results:
+            title = _safe_str(item.get("title"))
+            if not title:
+                continue
+
+            # Authors — CORE returns a list of author name strings
+            raw_authors = item.get("authors") or []
+            if isinstance(raw_authors, list):
+                authors: List[str] = [
+                    _safe_str(a.get("name") if isinstance(a, dict) else a)
+                    for a in raw_authors if a
+                ]
+            else:
+                authors = []
+
+            papers.append({
+                "title":     title,
+                "abstract":  _safe_str(item.get("abstract")),
+                "authors":   authors,
+                "year":      _safe_str(item.get("yearPublished")),
+                "url":       _safe_str(item.get("downloadUrl")),
+                "source":    "core",
+                "id":        _safe_str(item.get("id")),
+                "full_text": _safe_str(item.get("fullText")),
+            })
+
+        logger.info("fetch_core: retrieved %d paper(s) for query '%s'.", len(papers), query)
+        return papers
+
+    except Exception as exc:
+        logger.error("fetch_core: failed — %s", exc)
+        return []
+
+
 def fetch_papers(query: str, max_results: int = 20) -> List[Dict[str, Any]]:
     """
     Primary paper-fetching entry-point for the Research Assistant Agent.
 
-    Strategy
-    --------
-    1. Fetch from arXiv (``max_results // 2 + 5`` results).
-    2. **Always** also fetch from Semantic Scholar (remaining budget).
-    3. If arXiv returned fewer than :data:`ARXIV_MIN_RESULTS_BEFORE_SS`
-       papers, the Semantic Scholar quota is increased to ``max_results``.
-    4. Combine both lists (de-duplication is handled by the caller via
-       ``utils.deduplicator``).
+    Queries all five sources in parallel-ish sequence and combines results.
+    De-duplication is handled downstream by ``utils.deduplicator``.
+
+    Sources
+    -------
+    * arXiv          — primary CS/AI/ML source
+    * Semantic Scholar — cross-domain citation graph
+    * OpenAlex       — open-access metadata
+    * PubMed         — biomedical literature
+    * CORE           — open-access full-text (requires API key)
 
     Parameters
     ----------
@@ -290,30 +624,19 @@ def fetch_papers(query: str, max_results: int = 20) -> List[Dict[str, Any]]:
         logger.warning("fetch_papers: empty query received.")
         return []
 
-    arxiv_limit: int = max(max_results // 2 + 5, 5)
-    ss_limit: int = max(max_results // 2, 5)
+    arxiv_papers    = fetch_arxiv(query,            max_results // 3 + 5)
+    ss_papers       = fetch_semantic_scholar(query, max_results // 4)
+    openalex_papers = fetch_openalex(query,         max_results // 4)
+    pubmed_papers   = fetch_pubmed(query,           max_results // 5)
+    core_papers     = fetch_core(query,             max_results // 5)
 
-    logger.info(
-        "fetch_papers: querying arXiv (limit=%d) + Semantic Scholar (limit=%d).",
-        arxiv_limit, ss_limit,
+    combined: List[Dict[str, Any]] = (
+        arxiv_papers + ss_papers + openalex_papers + pubmed_papers + core_papers
     )
 
-    arxiv_papers: List[Dict[str, Any]] = fetch_arxiv(query, max_results=arxiv_limit)
-
-    # If arXiv results are thin, use full budget for Semantic Scholar
-    if len(arxiv_papers) < ARXIV_MIN_RESULTS_BEFORE_SS:
-        ss_limit = max_results
-        logger.info(
-            "fetch_papers: arXiv returned only %d results; expanding SS limit to %d.",
-            len(arxiv_papers), ss_limit,
-        )
-
-    ss_papers: List[Dict[str, Any]] = fetch_semantic_scholar(query, max_results=ss_limit)
-
-    combined: List[Dict[str, Any]] = arxiv_papers + ss_papers
     logger.info(
-        "fetch_papers: combined total = %d paper(s) "
-        "(arXiv=%d, SemanticScholar=%d).",
-        len(combined), len(arxiv_papers), len(ss_papers),
+        "fetch_papers: sources — arXiv=%d SS=%d OpenAlex=%d PubMed=%d CORE=%d total=%d",
+        len(arxiv_papers), len(ss_papers), len(openalex_papers),
+        len(pubmed_papers), len(core_papers), len(combined),
     )
     return combined
