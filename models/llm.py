@@ -15,6 +15,7 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
+from langchain_core.messages import SystemMessage, HumanMessage
 
 load_dotenv()
 
@@ -23,8 +24,8 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 GROQ_MODEL: str = "llama-3.3-70b-versatile"
 LLM_TEMPERATURE: float = 0.3
-LLM_MAX_TOKENS: int = 2048          # raised to fit the summary report
-SUMMARIZE_TOP_N: int = 10           # max papers sent to the summariser
+LLM_MAX_TOKENS: int = 4096          # large enough for a full 10-section report
+SUMMARIZE_TOP_N: int = 15           # max papers sent to the summariser
 
 logger = logging.getLogger(__name__)
 
@@ -156,81 +157,189 @@ def validate_keywords(keywords: List[str], original_query: str) -> Dict[str, Any
 
 def summarize_papers(papers: List[Dict[str, Any]], query: str) -> str:
     """
-    Generate a structured research summary report using the LLM.
+    Generate a structured, 10-section academic literature-review report.
 
-    Sends up to :data:`SUMMARIZE_TOP_N` papers to Groq and asks it to
-    produce a formatted research summary report.
+    Sends up to :data:`SUMMARIZE_TOP_N` papers to Groq and instructs it to
+    synthesise insights across all papers rather than summarise them
+    individually.
 
     Parameters
     ----------
     papers : list of dict
-        Ranked paper dicts (each with title, abstract, authors, year, url).
+        Ranked paper dicts (each with title, abstract, authors, year,
+        url, source).
     query : str
-        The original user query — included in the report header.
+        The original user query — embedded in the report header.
 
     Returns
     -------
     str
-        Formatted research summary report.  On LLM failure, returns a
-        human-readable fallback error string.
+        Full structured report.  On LLM failure a plain-text fallback
+        listing paper titles and URLs is returned instead.
     """
     if not papers:
         return "No papers available to summarise."
 
-    # Trim to top N and format for the prompt
     top_papers: List[Dict[str, Any]] = papers[:SUMMARIZE_TOP_N]
     paper_count: int = len(top_papers)
 
+    # ── Step 1: dynamic metadata ──────────────────────────────────────────────
+    years: List[int] = [
+        int(p["year"]) for p in papers
+        if p.get("year") and str(p.get("year")).isdigit()
+    ]
+    min_year = min(years) if years else "N/A"
+    max_year = max(years) if years else "N/A"
+    coverage = f"{min_year} – {max_year}"
+
+    source_map: Dict[str, str] = {
+        "arxiv":            "arXiv",
+        "semantic_scholar": "Semantic Scholar",
+        "openalex":         "OpenAlex",
+        "pubmed":           "PubMed",
+        "core":             "CORE",
+    }
+    unique_sources: List[str] = []
+    seen: set = set()
+    for p in papers:
+        src = str(p.get("source", "")).lower()
+        for key, label in source_map.items():
+            if key in src and label not in seen:
+                unique_sources.append(label)
+                seen.add(label)
+    sources_str = " · ".join(unique_sources) if unique_sources else "arXiv · Semantic Scholar"
+
+    # ── Step 2: format paper list for prompt ──────────────────────────────────
     papers_text: str = ""
     for i, paper in enumerate(top_papers, 1):
         authors = paper.get("authors", [])
-        author_str = (
-            ", ".join(authors[:3]) + (" et al." if len(authors) > 3 else "")
-            if isinstance(authors, list)
-            else str(authors)
-        )
-        papers_text += (
-            f"{i}. Title: {paper.get('title', 'N/A')}\n"
-            f"   Authors: {author_str}\n"
-            f"   Year: {paper.get('year', 'N/A')}\n"
-            f"   URL: {paper.get('url', 'N/A')}\n"
-            f"   Abstract: {str(paper.get('abstract', ''))[:400]}\n\n"
-        )
+        if isinstance(authors, list):
+            author_str = ", ".join(authors[:3])
+            if len(authors) > 3:
+                author_str += " et al."
+        else:
+            author_str = str(authors)
 
-    prompt: str = (
-        f"You are an expert research analyst. Analyse these {paper_count} papers "
-        f"related to the query: '{query}'\n\n"
-        f"{papers_text}\n"
-        "Generate a comprehensive research summary report in this EXACT format "
-        "(preserve all headers exactly):\n\n"
-        "RESEARCH SUMMARY REPORT\n"
-        "========================\n"
-        f"Query: {query}\n"
-        f"Papers Analyzed: {paper_count}\n\n"
-        "OVERVIEW\n"
-        "--------\n"
-        "[Write 2-3 paragraphs summarising what these papers collectively cover]\n\n"
-        "KEY FINDINGS\n"
-        "------------\n"
-        "• [finding 1]\n"
-        "• [finding 2]\n"
-        "• [finding 3]\n"
-        "• [finding 4]\n"
-        "• [finding 5]\n\n"
-        "TOP PAPERS\n"
-        "----------\n"
-        "[For each paper: Number. Title — Authors (Year)\\n   Summary: 1-2 lines\\n   Link: url]\n\n"
-        "KEY TAKEAWAYS\n"
-        "-------------\n"
-        "[Describe common conclusions and patterns across the papers]\n\n"
-        "RECOMMENDATIONS\n"
-        "---------------\n"
-        "[Which papers to read first and why]\n"
-    )
+        papers_text += f"""
+Paper {i}:
+Title: {paper.get('title', 'N/A')}
+Authors: {author_str}
+Year: {paper.get('year', 'N/A')}
+URL: {paper.get('url', 'N/A')}
+Abstract: {str(paper.get('abstract', ''))[:400]}
+---"""
 
+    # ── Step 3: system prompt ─────────────────────────────────────────────────
+    system_prompt = """You are a research synthesis assistant.
+
+Your task is NOT to summarize papers individually.
+Synthesize insights across all papers and produce
+a structured academic literature review.
+
+RULES:
+- Write in academic literature-review style
+- Identify common themes across papers
+- Group methods into approach families with table
+- Avoid generic summaries — be specific
+- Highlight limitations and research gaps
+- Add inline citations like [Author et al., Year]
+- If papers disagree explain the disagreement
+- Output clean markdown only
+- Each section header on its OWN line
+- Always use ## for headers
+- Always use --- as section dividers
+- No icons or emojis anywhere in output"""
+
+    # ── Step 4: user prompt with exact 9-section template ─────────────────
+    user_prompt = f"""User Query:
+{query}
+
+Retrieved Papers:
+{papers_text}
+
+Generate the research summary using EXACTLY this structure:
+
+---
+## RESEARCH SUMMARY REPORT
+
+**Query:** {query}
+**Sources:** {sources_str}
+**Coverage:** {coverage}
+
+---
+## 1. OVERVIEW
+
+[2-3 paragraphs about the research problem,
+why it matters, overall direction of the field]
+
+---
+## 2. FIELD LANDSCAPE
+
+[How the field evolved over time.
+Early approaches → modern approaches → emerging trends.
+Include inline citations like [Author et al., Year]]
+
+---
+## 3. MAIN APPROACH FAMILIES
+
+| Approach | Description | Strengths | Limitations |
+|----------|-------------|-----------|-------------|
+[Fill with 3-5 approach families from papers]
+
+---
+## 4. KEY FINDINGS
+
+- Finding 1 [Citation]
+- Finding 2 [Citation]
+- Finding 3 [Citation]
+- Finding 4 [Citation]
+- Finding 5 [Citation]
+
+---
+## 5. TOP PAPERS
+
+**Title — Authors (Year)**
+Contribution: [main contribution in 1-2 lines]
+Link: [url]
+
+[repeat for each top paper]
+
+---
+## 6. COMMON CHALLENGES
+
+- **Challenge 1:** explanation
+- **Challenge 2:** explanation
+- **Challenge 3:** explanation
+
+---
+## 7. RESEARCH GAPS
+
+- **Gap 1:** explanation
+- **Gap 2:** explanation
+- **Gap 3:** explanation
+
+---
+## 8. FUTURE RESEARCH DIRECTIONS
+
+- **Direction 1:** explanation
+- **Direction 2:** explanation
+- **Direction 3:** explanation
+
+---
+## 9. KEY TAKEAWAY
+
+[2-3 paragraph synthesis of current state,
+what works, what doesn't, what comes next]
+"""
+
+    # ── Step 5: call LLM ──────────────────────────────────────────────────────
     try:
         llm = get_llm()
-        response = llm.invoke(prompt)
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+        response = llm.invoke(messages)
         summary: str = (
             response.content if hasattr(response, "content") else str(response)
         ).strip()
@@ -238,26 +347,35 @@ def summarize_papers(papers: List[Dict[str, Any]], query: str) -> str:
         if not summary:
             raise ValueError("LLM returned an empty response.")
 
-        logger.info("summarize_papers: summary generated (%d chars).", len(summary))
+        logger.info("summarize_papers: report generated (%d chars).", len(summary))
         return summary
 
     except Exception as exc:
         logger.error("summarize_papers: LLM call failed — %s", exc)
-        # Graceful fallback — plain-text report built from paper metadata
+
+        # ── Step 6: plain-text fallback ───────────────────────────────────────
         fallback_lines = [
             "RESEARCH SUMMARY REPORT",
             "========================",
             f"Query: {query}",
             f"Papers Analyzed: {paper_count}",
+            f"Sources: {sources_str}",
+            f"Coverage: {coverage}",
             "",
-            "NOTE: Automated summary unavailable (LLM error). Raw paper list below.",
+            "NOTE: Automated synthesis unavailable (LLM error). Paper list below.",
             "",
             "TOP PAPERS",
             "----------",
         ]
         for i, paper in enumerate(top_papers, 1):
+            authors = paper.get("authors", [])
+            author_str = (
+                ", ".join(authors[:2]) + (" et al." if len(authors) > 2 else "")
+                if isinstance(authors, list) else str(authors)
+            )
             fallback_lines.append(
                 f"{i}. {paper.get('title', 'N/A')} "
-                f"({paper.get('year', 'N/A')}) — {paper.get('url', '')}"
+                f"— {author_str} ({paper.get('year', 'N/A')}) "
+                f"| {paper.get('url', '')}"
             )
         return "\n".join(fallback_lines)

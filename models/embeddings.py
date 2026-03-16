@@ -6,7 +6,8 @@ Personal Research Assistant Agent using Sentence Transformers and ChromaDB.
 """
 
 import logging
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Dict, Any, Optional, Tuple
 
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -24,9 +25,175 @@ CHROMA_PERSIST_DIR: str = "./chroma_db"
 CHROMA_COLLECTION_NAME: str = "research_papers"
 CHUNK_SIZE: int = 500
 CHUNK_OVERLAP: int = 50
+FULLTEXT_CHUNK_SIZE: int = 1000
+FULLTEXT_CHUNK_OVERLAP: int = 100
 RETRIEVER_TOP_K: int = 5
 
+# Standard academic section headings used for section-aware splitting
+SECTION_PATTERNS: List[str] = [
+    "Abstract", "Introduction", "Related Work", "Background",
+    "Methodology", "Method", "Approach", "Experiments",
+    "Results", "Evaluation", "Discussion", "Conclusion", "References",
+]
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+def split_by_sections(
+    text: str,
+    section_names: List[str],
+) -> List[Tuple[str, str]]:
+    """
+    Split *text* into ``(section_name, section_text)`` tuples by detecting
+    standard academic headings.
+
+    Detection is line-based: a line that matches a section name (case-insensitive,
+    with optional numbering) is treated as a heading.  If no sections are
+    detected the whole text is returned as a single ``("full_text", text)`` tuple.
+
+    Parameters
+    ----------
+    text : str
+        Raw paper text (e.g. from HTML extraction or PDF).
+    section_names : list of str
+        Section heading strings to search for.
+
+    Returns
+    -------
+    list of (str, str)
+        ``[(section_name, section_text), ...]`` preserving document order.
+    """
+    if not text or not text.strip():
+        return []
+
+    # Build a combined pattern: optional leading number + section name + optional colon
+    pattern = re.compile(
+        r"^(?:\d+\.?\s+)?({names})\s*:?\s*$".format(
+            names="|".join(re.escape(s) for s in section_names)
+        ),
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    lines = text.splitlines(keepends=True)
+    sections: List[Tuple[str, str]] = []
+    current_name = "full_text"
+    current_lines: List[str] = []
+
+    for line in lines:
+        m = pattern.match(line.strip())
+        if m:
+            # Save the previous section (if it has content)
+            body = "".join(current_lines).strip()
+            if body:
+                sections.append((current_name, body))
+            # Start a new section
+            current_name = m.group(1).strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    # Flush the last section
+    body = "".join(current_lines).strip()
+    if body:
+        sections.append((current_name, body))
+
+    # Fallback: no headings matched
+    if not sections:
+        return [("full_text", text)]
+
+    return sections
+
+
+def _chunk_paper(
+    paper: Dict[str, Any],
+    authors_str: str,
+) -> List[Document]:
+    """
+    Convert a single paper dict into a list of LangChain :class:`Document`
+    objects suitable for insertion into the vector store.
+
+    If the paper contains a ``full_text`` field the text is split
+    section-by-section with 1000-char chunks; otherwise the abstract is
+    chunked with the original 500-char splitter.
+
+    Parameters
+    ----------
+    paper : dict
+        Paper metadata dict (must contain at least ``title``).
+    authors_str : str
+        Pre-formatted author string.
+
+    Returns
+    -------
+    list of Document
+        Ready-to-embed LangChain documents with metadata.
+    """
+    title        = str(paper.get("title", "Untitled")).strip()
+    abstract     = str(paper.get("abstract", "")).strip()
+    full_text    = str(paper.get("full_text", "")).strip()
+    content_type = str(paper.get("content_type", "abstract"))
+
+    base_metadata: Dict[str, Any] = {
+        "title":        title,
+        "authors":      authors_str,
+        "year":         str(paper.get("year", "")),
+        "url":          str(paper.get("url", "")),
+        "source":       str(paper.get("source", "")),
+        "citations":    str(paper.get("citations", "0")),
+        "content_type": content_type,
+    }
+
+    documents: List[Document] = []
+
+    if full_text:
+        # ── Section-aware chunking for full-text papers ──────────────────────
+        section_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=FULLTEXT_CHUNK_SIZE,
+            chunk_overlap=FULLTEXT_CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+        sections = split_by_sections(full_text, SECTION_PATTERNS)
+        for section_name, section_text in sections:
+            if len(section_text.strip()) < 50:
+                continue
+            section_metadata = {**base_metadata, "section": section_name}
+            prefixed = f"[Section: {section_name}]\n{section_text}"
+            try:
+                chunks = section_splitter.create_documents(
+                    texts=[prefixed],
+                    metadatas=[section_metadata],
+                )
+                documents.extend(chunks)
+            except Exception as exc:
+                logger.warning(
+                    "_chunk_paper: failed to chunk section '%s' of '%s': %s",
+                    section_name, title, exc,
+                )
+    else:
+        # ── Fallback: abstract-only chunking ──────────────────────────────
+        abstract_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", " ", ""],
+        )
+        abstract_text = f"Title: {title}\n\nAbstract: {abstract}"
+        abstract_metadata = {**base_metadata, "section": "abstract"}
+        try:
+            chunks = abstract_splitter.create_documents(
+                texts=[abstract_text],
+                metadatas=[abstract_metadata],
+            )
+            documents.extend(chunks)
+        except Exception as exc:
+            logger.warning(
+                "_chunk_paper: failed to chunk abstract of '%s': %s", title, exc
+            )
+
+    return documents
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +334,7 @@ def add_papers_to_store(papers: List[Dict[str, Any]]) -> int:
             logger.warning("Skipping non-dict item in papers list: %r", paper)
             continue
 
-        url: str = str(paper.get("url", "")).strip()
+        url: str   = str(paper.get("url", "")).strip()
         title: str = str(paper.get("title", "Untitled")).strip()
 
         # Skip if this paper URL is already indexed.
@@ -176,34 +343,31 @@ def add_papers_to_store(papers: List[Dict[str, Any]]) -> int:
             continue
 
         abstract: str = str(paper.get("abstract", "")).strip()
-        if not abstract:
-            logger.warning("Paper '%s' has no abstract; skipping.", title)
+        full_text: str = str(paper.get("full_text", "")).strip()
+        if not abstract and not full_text:
+            logger.warning("Paper '%s' has no abstract or full text; skipping.", title)
             continue
 
-        authors: str = (
+        authors_str: str = (
             ", ".join(paper["authors"])
             if isinstance(paper.get("authors"), list)
             else str(paper.get("authors", "Unknown"))
         )
 
-        metadata: Dict[str, Any] = {
-            "title": title,
-            "authors": authors,
-            "year": str(paper.get("year", "")),
-            "url": url,
-            "source": str(paper.get("source", "")),
-        }
+        # Section-aware chunking via helper
+        try:
+            paper_docs = _chunk_paper(paper, authors_str)
+        except Exception as exc:
+            logger.error("_chunk_paper failed for '%s': %s", title, exc)
+            continue
 
-        # Prepend the title so every chunk carries context.
-        full_text: str = f"Title: {title}\n\n{abstract}"
-        chunks: List[Document] = splitter.create_documents(
-            texts=[full_text],
-            metadatas=[metadata],
-        )
-
-        documents.extend(chunks)
-        papers_added += 1
-        logger.debug("Prepared %d chunk(s) for '%s'", len(chunks), title)
+        if paper_docs:
+            documents.extend(paper_docs)
+            papers_added += 1
+            logger.debug(
+                "Prepared %d chunk(s) for '%s' (content_type=%s)",
+                len(paper_docs), title, paper.get("content_type", "abstract"),
+            )
 
     # -----------------------------------------------------------------------
     # Batch-add all new chunks in one call for efficiency.
