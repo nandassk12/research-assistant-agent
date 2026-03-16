@@ -1,31 +1,28 @@
 """
 src/chatbot.py
 
-Context-aware conversational RAG chatbot for the Personal Research Assistant Agent.
+Context-aware research chat using direct Groq LLM calls.
 
-The chat chain is primed with the full research session context (query, summary,
-top papers) so the assistant acts as a true research companion that knows exactly
-which papers were found and what was discovered.
+Replaces the brittle ConversationalRetrievalChain approach with a plain
+dict-based context object and explicit message construction.  This avoids
+all LangChain chain compatibility issues while retaining full RAG grounding.
 """
 
 import logging
 from typing import Any, Dict, List, Optional
 
-from langchain_classic.chains import ConversationalRetrievalChain
-from langchain_classic.memory import ConversationBufferMemory
-from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 from models.llm import get_llm
 from models.embeddings import get_retriever
 
 # ---------------------------------------------------------------------------
-# Configuration constants
+# Configuration
 # ---------------------------------------------------------------------------
-MEMORY_KEY: str = "chat_history"
-OUTPUT_KEY: str = "answer"
-CHAIN_VERBOSE: bool = False
-MAX_CONTEXT_PAPERS: int = 5        # top N papers included in system prompt
-SUMMARY_PREVIEW_CHARS: int = 800   # chars of summary shown to LLM
+MAX_HISTORY_MESSAGES: int = 6      # keep last N turns to avoid token overflow
+MAX_PAPERS_IN_PROMPT: int = 5      # top N papers listed in system prompt
+SUMMARY_PREVIEW_CHARS: int = 600   # chars of summary embedded in prompt
+CHUNKS_PREVIEW_CHARS: int = 1500   # chars of retrieved excerpt text
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +33,13 @@ logger = logging.getLogger(__name__)
 
 def _format_papers_for_prompt(papers: List[Dict[str, Any]]) -> str:
     """
-    Format the top :data:`MAX_CONTEXT_PAPERS` papers as a numbered list
-    suitable for embedding in a system prompt.
+    Format the top :data:`MAX_PAPERS_IN_PROMPT` papers as a numbered list
+    for embedding in the system prompt.
 
     Parameters
     ----------
     papers : list of dict
-        Ranked paper dicts.
+        Ranked paper dicts from the agent pipeline.
 
     Returns
     -------
@@ -51,64 +48,46 @@ def _format_papers_for_prompt(papers: List[Dict[str, Any]]) -> str:
     """
     if not papers:
         return "  (no papers available)"
-
     lines: List[str] = []
-    for i, paper in enumerate(papers[:MAX_CONTEXT_PAPERS], 1):
+    for i, paper in enumerate(papers[:MAX_PAPERS_IN_PROMPT], 1):
         title = str(paper.get("title", "Untitled"))
         authors_raw = paper.get("authors", [])
         if isinstance(authors_raw, list):
-            authors = ", ".join(authors_raw[:3]) + (" et al." if len(authors_raw) > 3 else "")
+            au = ", ".join(authors_raw[:3]) + (" et al." if len(authors_raw) > 3 else "")
         else:
-            authors = str(authors_raw)
+            au = str(authors_raw)
         year = str(paper.get("year", "N/A"))
-        lines.append(f"  {i}. {title} — {authors} ({year})")
+        lines.append(f"  {i}. {title} — {au} ({year})")
     return "\n".join(lines)
 
 
-def _build_system_prompt(
-    query: str,
-    summary: str,
-    papers: List[Dict[str, Any]],
-) -> str:
+def _build_history_messages(history: List[Dict[str, str]]) -> List:
     """
-    Build the system prompt that grounds the chatbot in the current research session.
+    Convert the stored history list into LangChain message objects.
+
+    Only the last :data:`MAX_HISTORY_MESSAGES` messages are included to
+    prevent token overflow.
 
     Parameters
     ----------
-    query : str
-        Original research query.
-    summary : str
-        LLM-generated research summary.
-    papers : list of dict
-        Ranked paper list from the agent pipeline.
+    history : list of dict
+        Each dict has ``role`` (``"user"`` or ``"assistant"``) and
+        ``content`` keys.
 
     Returns
     -------
-    str
-        Full system prompt string.
+    list
+        List of :class:`~langchain_core.messages.HumanMessage` /
+        :class:`~langchain_core.messages.AIMessage` objects.
     """
-    papers_text = _format_papers_for_prompt(papers)
-    summary_preview = (summary or "")[:SUMMARY_PREVIEW_CHARS]
-    paper_count = len(papers) if papers else 0
-
-    return f"""You are an expert research assistant. You have just analyzed \
-{paper_count} academic papers about: '{query}'
-
-RESEARCH SUMMARY:
-{summary_preview}
-
-PAPERS ANALYZED:
-{papers_text}
-
-YOUR ROLE:
-- Answer questions specifically about these papers
-- Compare methodologies and findings across papers
-- Suggest which papers to read first based on the user's needs
-- Explain technical concepts that appear in the papers
-- Always cite specific paper titles when answering
-- If asked something not covered in the papers, say so honestly
-
-Always ground your answers in the actual papers found. Be concise and helpful."""
+    recent = history[-MAX_HISTORY_MESSAGES:]
+    messages = []
+    for msg in recent:
+        if msg.get("role") == "user":
+            messages.append(HumanMessage(content=msg["content"]))
+        else:
+            messages.append(AIMessage(content=msg["content"]))
+    return messages
 
 
 # ---------------------------------------------------------------------------
@@ -119,169 +98,174 @@ def get_chat_chain(
     query: str = "",
     summary: str = "",
     papers: Optional[List[Dict[str, Any]]] = None,
-) -> ConversationalRetrievalChain:
+) -> Dict[str, Any]:
     """
-    Build a context-aware ConversationalRetrievalChain for the current session.
+    Build and return a research-session context dict.
 
-    The chain is primed with a system prompt containing the research query,
-    a preview of the generated summary, and the top papers, so the assistant
-    can answer follow-up questions as a true research companion.
+    This replaces the old ``ConversationalRetrievalChain`` with a plain dict
+    that stores session state.  No LangChain chain is constructed here —
+    the LLM is called directly inside :func:`chat`.
 
     Parameters
     ----------
     query : str, optional
-        The original research query from this session.
+        The original research query for this session.
     summary : str, optional
-        The LLM-generated research summary report.
+        LLM-generated research summary from the agent pipeline.
     papers : list of dict, optional
-        Ranked paper dicts from the agent pipeline.
+        Ranked paper list from the agent pipeline.
 
     Returns
     -------
-    ConversationalRetrievalChain
-        Ready-to-use chain with session context baked into the system prompt.
-
-    Raises
-    ------
-    RuntimeError
-        If the chain cannot be constructed.
+    dict
+        Context dict with keys: ``query``, ``summary``, ``papers``,
+        ``history``.
     """
-    papers = papers or []
-
-    try:
-        llm = get_llm()
-        retriever = get_retriever()
-        memory = ConversationBufferMemory(
-            memory_key=MEMORY_KEY,
-            return_messages=True,
-            output_key=OUTPUT_KEY,
-        )
-
-        # Build a context-rich system prompt
-        system_prompt = _build_system_prompt(query, summary, papers)
-
-        # Combine system context with the retrieved document context
-        condense_prompt = ChatPromptTemplate.from_messages([
-            SystemMessagePromptTemplate.from_template(system_prompt),
-            MessagesPlaceholder(variable_name=MEMORY_KEY),
-            HumanMessagePromptTemplate.from_template("{question}"),
-        ])
-
-        chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=retriever,
-            memory=memory,
-            return_source_documents=True,
-            verbose=CHAIN_VERBOSE,
-            condense_question_prompt=condense_prompt,
-        )
-
-        logger.info(
-            "get_chat_chain: chain created for query '%s' with %d papers.",
-            query[:60], len(papers),
-        )
-        return chain
-
-    except Exception as exc:
-        logger.error("get_chat_chain: failed to create chain — %s", exc)
-        raise RuntimeError(f"Could not build chat chain: {exc}") from exc
+    context: Dict[str, Any] = {
+        "query": query,
+        "summary": summary,
+        "papers": papers or [],
+        "history": [],
+    }
+    logger.info(
+        "get_chat_chain: context created for query '%s' with %d papers.",
+        query[:60], len(context["papers"]),
+    )
+    return context
 
 
 def chat(
-    chain: ConversationalRetrievalChain,
+    context: Dict[str, Any],
     user_message: str,
-    papers: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    Send a user message to the RAG chain and return a grounded answer.
+    Answer a follow-up question using direct LLM invocation + RAG retrieval.
 
-    Extracts source metadata and identifies suggested papers most relevant
-    to the question for display in the UI.
+    Workflow
+    --------
+    1. Retrieve relevant paper chunks from ChromaDB.
+    2. Build a system prompt containing research context, top papers, and
+       retrieved excerpts.
+    3. Prepend recent history and append the user message.
+    4. Call the Groq LLM directly (no chain).
+    5. Update session history in ``context``.
+    6. Return answer, sources, and updated context.
 
     Parameters
     ----------
-    chain : ConversationalRetrievalChain
-        Chain instance created by :func:`get_chat_chain`.
+    context : dict
+        Session context dict created by :func:`get_chat_chain`.
     user_message : str
         User's follow-up question.
-    papers : list of dict, optional
-        Full paper list (used to populate ``suggested_papers``).
 
     Returns
     -------
     dict
         Keys:
-        * ``answer``           – str, LLM response grounded in retrieved chunks.
-        * ``sources``          – list of dicts with ``title``, ``url``.
-        * ``suggested_papers`` – list of 2–3 paper title strings most relevant
-                                 to the question (matched by keyword overlap).
+        * ``answer``  – str, LLM response.
+        * ``sources`` – list of dicts with ``title`` and ``url``.
+        * ``context`` – updated context dict (caller must store this).
     """
-    papers = papers or []
-
     if not isinstance(user_message, str) or not user_message.strip():
-        logger.warning("chat: received empty user message.")
-        return {"answer": "Please enter a question.", "sources": [], "suggested_papers": []}
-
-    try:
-        response: Dict[str, Any] = chain.invoke({"question": user_message.strip()})
-
-        answer: str = str(response.get(OUTPUT_KEY, "")).strip()
-        if not answer:
-            answer = "I could not find a relevant answer in the stored papers."
-
-        # ── Extract unique source references ───────────────────────────────
-        source_docs: List[Any] = response.get("source_documents", [])
-        seen_urls: set = set()
-        sources: List[Dict[str, str]] = []
-        for doc in source_docs:
-            meta: Dict[str, Any] = getattr(doc, "metadata", {}) or {}
-            url: str = str(meta.get("url", "")).strip()
-            title: str = str(meta.get("title", "Unknown")).strip()
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                sources.append({"title": title, "url": url})
-
-        # ── Suggested papers (simple keyword overlap) ──────────────────────
-        suggested_papers: List[str] = []
-        if papers:
-            query_lower = user_message.lower()
-            scored = []
-            for p in papers:
-                title = str(p.get("title", ""))
-                abstract = str(p.get("abstract", ""))
-                text = (title + " " + abstract).lower()
-                # Count how many query words appear in the paper text
-                overlap = sum(1 for word in query_lower.split() if len(word) > 3 and word in text)
-                scored.append((overlap, title))
-            scored.sort(reverse=True)
-            suggested_papers = [t for _, t in scored[:3] if t]
-
-        logger.info("chat: %d source(s), %d suggestion(s).", len(sources), len(suggested_papers))
-        return {"answer": answer, "sources": sources, "suggested_papers": suggested_papers}
-
-    except Exception as exc:
-        logger.error("chat: chain invocation failed — %s", exc)
         return {
-            "answer": (
-                "Sorry, I encountered an error while searching the papers. "
-                "Please try rephrasing your question."
-            ),
+            "answer": "Please enter a question.",
             "sources": [],
-            "suggested_papers": [],
+            "context": context,
         }
 
+    query      = context.get("query", "")
+    summary    = context.get("summary", "")
+    papers     = context.get("papers", [])
+    history    = context.get("history", [])
 
-def reset_chat(chain: ConversationalRetrievalChain) -> None:
+    # ── Step 1: retrieve relevant chunks ─────────────────────────────────────
+    docs = []
+    sources: List[Dict[str, str]] = []
+    try:
+        retriever = get_retriever()
+        docs = retriever.invoke(user_message.strip())
+    except Exception as exc:
+        logger.warning("chat: retriever failed — %s", exc)
+
+    # Deduplicate sources from metadata
+    seen_urls: set = set()
+    for doc in docs:
+        meta = getattr(doc, "metadata", {}) or {}
+        url   = str(meta.get("url", "")).strip()
+        title = str(meta.get("title", "Unknown")).strip()
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            sources.append({"title": title, "url": url})
+
+    # ── Step 2: build system prompt ───────────────────────────────────────────
+    papers_text = _format_papers_for_prompt(papers)
+    chunks_text = "\n\n".join(
+        getattr(doc, "page_content", "") for doc in docs
+    )[:CHUNKS_PREVIEW_CHARS]
+    summary_preview = (summary or "")[:SUMMARY_PREVIEW_CHARS]
+
+    system_prompt = f"""You are an expert research assistant analyzing \
+{len(papers)} papers about: '{query}'
+
+RESEARCH CONTEXT:
+{summary_preview}
+
+PAPERS ANALYZED:
+{papers_text}
+
+RELEVANT PAPER EXCERPTS:
+{chunks_text if chunks_text else "(no excerpts retrieved)"}
+
+Always cite specific paper titles when answering.
+Be concise and helpful.
+If the question is not covered in the papers, say so honestly."""
+
+    # ── Step 3: assemble message list ─────────────────────────────────────────
+    messages = (
+        [SystemMessage(content=system_prompt)]
+        + _build_history_messages(history)
+        + [HumanMessage(content=user_message.strip())]
+    )
+
+    # ── Step 4: call LLM ──────────────────────────────────────────────────────
+    try:
+        llm    = get_llm()
+        resp   = llm.invoke(messages)
+        answer = str(resp.content).strip() if resp and resp.content else ""
+        if not answer:
+            answer = "I could not find a relevant answer in the stored papers."
+    except Exception as exc:
+        logger.error("chat: LLM call failed — %s", exc)
+        answer = (
+            "Sorry, I encountered an error while generating an answer. "
+            "Please try rephrasing your question."
+        )
+
+    # ── Step 5: update history ────────────────────────────────────────────────
+    context["history"].append({"role": "user",      "content": user_message.strip()})
+    context["history"].append({"role": "assistant", "content": answer})
+
+    logger.info("chat: answered (%d chars), %d source(s).", len(answer), len(sources))
+    return {"answer": answer, "sources": sources, "context": context}
+
+
+def reset_chat(context: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Clear the conversation memory of a chat chain.
+    Clear the conversation history in the context dict.
 
     Parameters
     ----------
-    chain : ConversationalRetrievalChain
-        Chain instance whose memory should be reset.
+    context : dict
+        Session context dict returned by :func:`get_chat_chain`.
+
+    Returns
+    -------
+    dict
+        The same context dict with ``history`` set to ``[]``.
     """
     try:
-        chain.memory.clear()
-        logger.info("reset_chat: conversation memory cleared.")
+        context["history"] = []
+        logger.info("reset_chat: history cleared.")
     except Exception as exc:
-        logger.warning("reset_chat: could not clear memory — %s", exc)
+        logger.warning("reset_chat: failed to clear history — %s", exc)
+    return context
