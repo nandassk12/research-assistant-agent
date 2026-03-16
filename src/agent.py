@@ -181,14 +181,31 @@ def run_agent(query: str, max_results: int = 20) -> Dict[str, Any]:
 
     # ── STEP 3: Fetch papers ───────────────────────────────────────────────
     try:
+        from src.scraper import enrich_papers_with_fulltext
+
         topic_type: str = _determine_topic_type(original_query)
         logger.info("Step 3: topic_type='%s', search_query='%s'", topic_type, search_query)
 
+        # Fetch from all 5 API sources
         fetched_papers: List[Dict[str, Any]] = fetch_papers(
             search_query, max_results=max_results
         )
         logger.info("Step 3: fetch_papers returned %d result(s).", len(fetched_papers))
 
+        # Always enrich with full text where available
+        try:
+            fetched_papers = enrich_papers_with_fulltext(fetched_papers)
+        except Exception as enrich_exc:
+            logger.warning("Step 3: full-text enrichment failed — %s", enrich_exc)
+
+        # Log source diversity breakdown
+        source_counts: Dict[str, int] = {}
+        for p in fetched_papers:
+            src = str(p.get("source", "unknown"))
+            source_counts[src] = source_counts.get(src, 0) + 1
+        logger.info("Step 3: source breakdown — %s", source_counts)
+
+        # Only scrape as fallback if truly not enough results
         scraped_papers: List[Dict[str, Any]] = []
         if len(fetched_papers) < MIN_FETCH_RESULTS:
             logger.info(
@@ -196,9 +213,10 @@ def run_agent(query: str, max_results: int = 20) -> Dict[str, Any]:
                 MIN_FETCH_RESULTS,
             )
             scraped_papers = scrape_papers(search_query, max_results=max_results)
-            logger.info("Step 3: scrape_papers returned %d result(s).", len(scraped_papers))
+            fetched_papers += scraped_papers
+            logger.info("Step 3: scrape_papers added %d result(s).", len(scraped_papers))
 
-        combined_papers: List[Dict[str, Any]] = fetched_papers + scraped_papers
+        combined_papers: List[Dict[str, Any]] = fetched_papers
         logger.info("Step 3 complete — combined total: %d paper(s).", len(combined_papers))
 
     except Exception as exc:
