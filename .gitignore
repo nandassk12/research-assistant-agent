@@ -5,3 +5,6 @@ chroma_db/
 .DS_Store
 venv/
 *.egg-info/ 
+research_memory.db 
+search_history.txt 
+test_file.py 
