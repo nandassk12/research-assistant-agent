@@ -11,6 +11,9 @@ import time
 from typing import Any, Dict, List
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -39,68 +42,6 @@ logger = logging.getLogger(__name__)
 # Core Search Functions
 # ---------------------------------------------------------------------------
 
-def search_datasets(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
-    """
-    Search PapersWithCode for datasets related to the query.
-
-    Uses the PWC REST API ``/datasets/`` endpoint.
-
-    Parameters
-    ----------
-    query : str
-        The search string for datasets.
-    max_results : int, default=5
-        Maximum number of dataset results to return.
-
-    Returns
-    -------
-    list of dict
-        A list of dataset dictionaries with keys:
-        ``name``, ``full_name``, ``url``, ``description``, ``paper_count``.
-        Returns an empty list `[]` on failure.
-    """
-    if not query.strip():
-        return []
-
-    url = f"{PWC_BASE_URL}/datasets/"
-    params = {
-        "q": query,
-        "page": 1,
-    }
-
-    try:
-        response = requests.get(
-            url, params=params, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        results = data.get("results", [])
-        datasets: List[Dict[str, Any]] = []
-
-        for item in results:
-            if len(datasets) >= max_results:
-                break
-
-            name = str(item.get("name", ""))
-            if not name:
-                continue
-
-            datasets.append({
-                "name": name,
-                "full_name": str(item.get("full_name", name)),
-                "url": f"https://paperswithcode.com/dataset/{name}",
-                "description": str(item.get("description", "")),
-                "paper_count": int(item.get("num_papers", 0))  # PWC API uses num_papers usually
-            })
-
-        logger.info("search_datasets: retrieved %d datasets for '%s'", len(datasets), query)
-        return datasets
-
-    except Exception as exc:
-        logger.error("search_datasets: failed for query '%s' — %s", query, exc)
-        return []
-
 
 def search_github_repos(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
     """
@@ -126,7 +67,9 @@ def search_github_repos(query: str, max_results: int = 5) -> List[Dict[str, Any]
     if not query.strip():
         return []
 
-    search_query = f"{query} machine learning"
+    # LLM keywords are already clean
+    # Use directly as GitHub search query
+    search_query = query.strip()
     params = {
         "q": search_query,
         "sort": "stars",
@@ -165,18 +108,15 @@ def search_github_repos(query: str, max_results: int = 5) -> List[Dict[str, Any]
 
 def get_related_resources(
     query: str,
-    max_datasets: int = 5,
     max_repos: int = 5
 ) -> Dict[str, Any]:
     """
-    Orchestrate fetching of both related datasets and GitHub repositories.
+    Fetch related GitHub repositories for a query.
 
     Parameters
     ----------
     query : str
         The primary research query.
-    max_datasets : int, default=5
-        Maximum number of datasets to retrieve.
     max_repos : int, default=5
         Maximum number of repositories to retrieve.
 
@@ -184,26 +124,19 @@ def get_related_resources(
     -------
     dict
         A dictionary containing:
-        - ``datasets``: List of dataset dicts
         - ``repos``: List of repository dicts
         - ``query``: The query used for searches
     """
     logger.info("get_related_resources: fetching resources for '%s'", query)
 
-    # 1. Fetch datasets
-    datasets = search_datasets(query, max_results=max_datasets)
-
-    # 2. Prevent rapid API thrashing
-    time.sleep(DELAY)
 
     # 3. Fetch GitHub repos
     repos = search_github_repos(query, max_results=max_repos)
 
-    total_results = len(datasets) + len(repos)
+    total_results = len(repos)
     logger.info("get_related_resources: completed, %d total resources found.", total_results)
 
     return {
-        "datasets": datasets,
         "repos": repos,
         "query": query
     }

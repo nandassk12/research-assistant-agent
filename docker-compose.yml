@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  research-assistant:
+    build: .
+    container_name: research-assistant-agent
+    ports:
+      - "8501:8501"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - CORE_API_KEY=${CORE_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./data:/app/data
+      - ./research_memory.db:/app/research_memory.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", 
+             "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

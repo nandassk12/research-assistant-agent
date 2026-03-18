@@ -248,7 +248,15 @@ RULES:
 - Each section header on its OWN line
 - Always use ## for headers
 - Always use --- as section dividers
-- No icons or emojis anywhere in output"""
+- No icons or emojis anywhere in output
+
+IMPORTANT FORMATTING RULES:
+- Never use numbered labels like 'Finding 1', 
+  'Gap 1', 'Challenge 1', 'Direction 1'
+- Each bullet point must start with the 
+  actual content or a bold keyword
+- Write like an academic literature review
+- Be specific, not generic"""
 
     # ── Step 4: user prompt with exact 9-section template ─────────────────
     user_prompt = f"""User Query:
@@ -289,11 +297,11 @@ Include inline citations like [Author et al., Year]]
 ---
 ## 4. KEY FINDINGS
 
-- Finding 1 [Citation]
-- Finding 2 [Citation]
-- Finding 3 [Citation]
-- Finding 4 [Citation]
-- Finding 5 [Citation]
+Write each finding as a direct statement 
+starting with the finding itself, not a label.
+Example: 'Transformer models outperform RNNs 
+on long sequences [Vaswani et al., 2017].'
+NOT: 'Finding 1: Transformer models...'
 
 ---
 ## 5. TOP PAPERS
@@ -307,23 +315,25 @@ Link: [url]
 ---
 ## 6. COMMON CHALLENGES
 
-- **Challenge 1:** explanation
-- **Challenge 2:** explanation
-- **Challenge 3:** explanation
+Write each challenge as a bold keyword 
+followed by explanation.
+Example: '**Data scarcity**: Most models require...'
+NOT: 'Challenge 1: Data scarcity...'
 
 ---
 ## 7. RESEARCH GAPS
 
-- **Gap 1:** explanation
-- **Gap 2:** explanation
-- **Gap 3:** explanation
+Write each gap as a bold keyword followed
+by explanation.
+Example: '**Cross-dataset evaluation**: Few studies...'
+NOT: 'Gap 1: Cross-dataset evaluation...'
 
 ---
 ## 8. FUTURE RESEARCH DIRECTIONS
 
-- **Direction 1:** explanation
-- **Direction 2:** explanation
-- **Direction 3:** explanation
+Write each direction as a bold action phrase.
+Example: '**Adversarial robustness**: Future work should...'
+NOT: 'Direction 1: Adversarial robustness...'
 
 ---
 ## 9. KEY TAKEAWAY

@@ -78,6 +78,55 @@ def _safe_text(value: Any, fallback: str = "N/A") -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+def _render_table(pdf: FPDF, rows: list, width: float) -> None:
+    if not rows:
+        return
+    
+    num_cols = max(len(row) for row in rows)
+    if num_cols == 0:
+        return
+    
+    col_width = width / num_cols
+    
+    for i, row in enumerate(rows):
+        is_header = (i == 0)
+        
+        # Calculate row height based on content
+        row_height = 7
+        
+        x_start = pdf.get_x()
+        y_start = pdf.get_y()
+        
+        for j, cell in enumerate(row):
+            # Pad row if fewer cells
+            text = cell if j < len(row) else ""
+            
+            pdf.set_xy(x_start + j * col_width, y_start)
+            
+            if is_header:
+                pdf.set_font("Helvetica", style="B", size=9)
+                pdf.set_fill_color(40, 40, 50)
+                fill = True
+            else:
+                pdf.set_font("Helvetica", style="", size=9)
+                pdf.set_fill_color(25, 25, 35)
+                fill = True
+            
+            pdf.set_draw_color(70, 70, 80)
+            pdf.cell(
+                col_width, row_height,
+                text[:40] + ("..." if len(text) > 40 else ""),
+                border=1,
+                fill=fill,
+                new_x="RIGHT",
+                new_y="TOP"
+            )
+        
+        pdf.ln(row_height)
+    
+    pdf.set_fill_color(255, 255, 255)
+    pdf.set_draw_color(0, 0, 0)
+
 def export_to_pdf(
     summary: str,
     query: str,
@@ -157,17 +206,89 @@ def export_to_pdf(
 
         pdf.set_font(PDF_FONT_FAMILY, style="", size=PDF_BODY_FONT_SIZE)
         clean_summary: str = _safe_text(summary, fallback="No summary available.")
+        
+        # Collect all table rows first, then render as table
+        table_rows = []
+        in_table = False
+        
         # Render line by line to preserve the report's section formatting
         for line in clean_summary.splitlines():
-            clean_line = _safe_text(line)
-            if clean_line.strip() == "":
-                pdf.ln(PDF_LINE_HEIGHT * 0.5)
-            else:
-                pdf.multi_cell(
-                    effective_width, PDF_LINE_HEIGHT,
-                    clean_line,
-                    new_x="LMARGIN", new_y="NEXT",
+            line = line.strip()
+            
+            # Skip unwanted lines
+            if not line or line == "N/A" or line == "---":
+                if line == "---":
+                    pdf.ln(2)
+                continue
+            
+            # Section headers
+            if line.startswith("## "):
+                title = line.replace("## ", "").strip()
+                title = title.replace("**", "")
+                pdf.ln(4)
+                pdf.set_font(PDF_FONT_FAMILY, style="B", size=12)
+                pdf.multi_cell(effective_width, 7, title,
+                    new_x="LMARGIN", new_y="NEXT")
+                pdf.ln(2)
+                pdf.set_font(PDF_FONT_FAMILY, style="", size=PDF_BODY_FONT_SIZE)
+                continue
+            
+            if line.startswith("|"):
+                # Skip separator rows
+                stripped = line.replace("|","").replace("-","").replace(" ","").replace(":","")
+                if not stripped:
+                    continue
+                cells = [c.strip().replace("**","") for c in line.split("|") if c.strip()]
+                if cells:
+                    table_rows.append(cells)
+                in_table = True
+                continue
+            
+            # When table ends render it
+            if in_table and not line.startswith("|"):
+                in_table = False
+                if table_rows:
+                    _render_table(pdf, table_rows, effective_width)
+                    table_rows = []
+                    pdf.ln(3)
+            
+            # Bullet points
+            if line.startswith("- "):
+                content = line[2:].strip().replace("**", "")
+                pdf.set_font(PDF_FONT_FAMILY, style="", size=PDF_BODY_FONT_SIZE)
+                pdf.multi_cell(effective_width, 6, f"  \u2022  {content}",
+                    new_x="LMARGIN", new_y="NEXT")
+                pdf.ln(1)
+                continue
+            
+            # Regular text (remove bold markers)
+            clean_line = line.replace("**", "")
+            
+            # Clickable link handling
+            if clean_line.startswith("Link: http"):
+                url = clean_line.replace("Link: ", "").strip()
+                pdf.set_font("Helvetica", style="U", size=9)
+                pdf.set_text_color(30, 100, 200)
+                pdf.cell(
+                    0, 6,
+                    url[:80] + ("..." if len(url) > 80 else ""),
+                    link=url,
+                    new_x="LMARGIN",
+                    new_y="NEXT"
                 )
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_font("Helvetica", style="", size=10)
+                pdf.ln(1)
+                continue
+            
+            if clean_line:
+                pdf.set_font(PDF_FONT_FAMILY, style="", size=PDF_BODY_FONT_SIZE)
+                pdf.multi_cell(effective_width, 6, clean_line,
+                    new_x="LMARGIN", new_y="NEXT")
+
+        # After loop ends check if table still pending:
+        if table_rows:
+            _render_table(pdf, table_rows, effective_width)
 
         # ── Divider ────────────────────────────────────────────────────────
         pdf.ln(3)

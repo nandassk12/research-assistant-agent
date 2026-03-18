@@ -214,3 +214,71 @@ def get_db_stats() -> Dict[str, Any]:
         logger.warning(f"Failed to get db stats: {exc}")
         
     return stats
+
+
+def save_repos(query: str, repos: list) -> None:
+    """
+    Saves a list of repositories for a specific query to the database.
+    """
+    try:
+        init_db()
+        # Ensure repos table exists
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS repos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query TEXT NOT NULL UNIQUE,
+                    repos_json TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            repos_str = json.dumps(repos)
+            
+            cursor.execute('''
+                INSERT INTO repos (query, repos_json, timestamp)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(query) DO UPDATE SET
+                    repos_json=excluded.repos_json,
+                    timestamp=CURRENT_TIMESTAMP
+            ''', (query, repos_str))
+            
+            conn.commit()
+            logger.info(f"Saved {len(repos)} repositories for query: {query[:30]}...")
+            
+    except Exception as exc:
+        logger.warning(f"Failed to save repos: {exc}")
+
+
+def get_repos(query: str) -> list:
+    """
+    Retrieves cached repositories for a specific query from the database.
+    """
+    try:
+        init_db()
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            
+            # First check if the table exists to avoid errors on old DBs
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='repos'"
+            )
+            if not cursor.fetchone():
+                return []
+                
+            cursor.execute('''
+                SELECT repos_json 
+                FROM repos 
+                WHERE query = ? 
+                ORDER BY timestamp DESC 
+                LIMIT 1
+            ''', (query,))
+            row = cursor.fetchone()
+            
+            if row:
+                return json.loads(row[0])
+    except Exception as exc:
+        logger.warning(f"Failed to retrieve repos: {exc}")
+        
+    return []

@@ -181,8 +181,6 @@ def run_agent(query: str, max_results: int = 20) -> Dict[str, Any]:
 
     # ── STEP 3: Fetch papers ───────────────────────────────────────────────
     try:
-        from src.scraper import enrich_papers_with_fulltext
-
         topic_type: str = _determine_topic_type(original_query)
         logger.info("Step 3: topic_type='%s', search_query='%s'", topic_type, search_query)
 
@@ -192,11 +190,7 @@ def run_agent(query: str, max_results: int = 20) -> Dict[str, Any]:
         )
         logger.info("Step 3: fetch_papers returned %d result(s).", len(fetched_papers))
 
-        # Always enrich with full text where available
-        try:
-            fetched_papers = enrich_papers_with_fulltext(fetched_papers)
-        except Exception as enrich_exc:
-            logger.warning("Step 3: full-text enrichment failed — %s", enrich_exc)
+        # Full-text enrichment Disabled
 
         # Log source diversity breakdown
         source_counts: Dict[str, int] = {}

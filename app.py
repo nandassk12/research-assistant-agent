@@ -69,7 +69,18 @@ sidebar_col, main_col, chat_col = st.columns([1, 3, 2], gap="large")
 with sidebar_col:
     st.markdown("### 🔬 Research Assistant")
     st.divider()
+    if st.button(
+        "🔍 New Search",
+        use_container_width=True,
+        type="primary"
+    ):
+        st.session_state.result = None
+        st.session_state.chat_history = []
+        st.session_state.selected_paper_idx = None
+        st.session_state.chat_chain = None
+        st.rerun()
     
+    st.divider()
     st.markdown("#### Recent Searches")
     
     recent_queries = get_recent_queries(5)
@@ -295,17 +306,18 @@ with main_col:
                     )
                 
                 # Table header
+                h1, h2, h3, h4 = st.columns([0.8, 1, 1, 7])
+                for col, label in zip(
+                    [h1, h2, h3, h4],
+                    ["REL.", "SOURCE", "CIT/YR", "TITLE"]
+                ):
+                    with col:
+                        st.markdown(
+                            f"<span style='color:#8b949e; font-size:11px; font-weight:600;'>{label}</span>",
+                            unsafe_allow_html=True
+                        )
                 st.markdown(
-                    "<div style='display:grid; "
-                    "grid-template-columns: 80px 60px 60px 1fr 30px; "
-                    "padding: 6px 4px; "
-                    "border-bottom: 1px solid #21262d;'>"
-                    "<span style='color:#8b949e; font-size:11px; font-weight:600;'>REL.</span>"
-                    "<span style='color:#8b949e; font-size:11px; font-weight:600;'>YEAR</span>"
-                    "<span style='color:#8b949e; font-size:11px; font-weight:600;'>CIT/YR</span>"
-                    "<span style='color:#8b949e; font-size:11px; font-weight:600;'>TITLE</span>"
-                    "<span></span>"
-                    "</div>",
+                    "<div style='border-bottom: 1px solid #21262d; margin-top: 4px; margin-bottom: 4px;'></div>",
                     unsafe_allow_html=True
                 )
                 
@@ -345,81 +357,84 @@ with main_col:
                     abstract = paper.get('abstract', '')
                     citations = paper.get('citations', '')
                     
-                    # Short ID — first author lastname + year
                     if isinstance(authors, list) and authors:
-                        last = authors[0].split()[-1][:3] if authors[0].split() else 'XX'
-                        short_id = f"{last}{str(year)[-2:]}" if year != 'N/A' else last
                         author_str = (
                             f"{authors[0]}, …, {authors[-1]}"
                             if len(authors) > 2
                             else ", ".join(authors)
                         )
                     else:
-                        short_id = "N/A"
                         author_str = str(authors)
-                    
-                    # Source color
-                    src_colors = {
-                        'arxiv': '#1d4ed8',
-                        'semantic': '#7c3aed',
-                        'openalex': '#059669',
-                        'pubmed': '#dc2626',
-                        'core': '#d97706'
-                    }
-                    src_color = next(
-                        (v for k,v in src_colors.items() if k in source.lower()),
-                        '#475569'
-                    )
-                    
-                    c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 5, 0.5])
+
+                    c1, c2, c3, c4 = st.columns([0.8, 1, 1, 7])
                     
                     with c1:
+                        # Relevance score badge (green)
                         st.markdown(
-                            f"<span style='background:{src_color}; color:white; "
-                            f"padding:2px 6px; border-radius:4px; "
-                            f"font-size:11px; font-weight:bold;'>{short_id}</span>",
+                            f"<span style='background:#14532d; color:#86efac; "
+                            f"padding:2px 7px; border-radius:4px; "
+                            f"font-size:11px; font-weight:bold;'>"
+                            f"{score:.2f}</span>",
                             unsafe_allow_html=True
                         )
                     
                     with c2:
+                        # Source badge
+                        source_labels = {
+                            'arxiv': ('ARXIV', '#1d4ed8', '#93c5fd'),
+                            'arxiv_scrape': ('ARXIV', '#1d4ed8', '#93c5fd'),
+                            'semantic_scholar': ('S2', '#7c3aed', '#c4b5fd'),
+                            'semantic_scholar_scrape': ('S2', '#7c3aed', '#c4b5fd'),
+                            'openalex': ('OA', '#059669', '#6ee7b7'),
+                            'pubmed': ('PM', '#dc2626', '#fca5a5'),
+                            'core': ('CORE', '#d97706', '#fcd34d'),
+                        }
+                        src_info = source_labels.get(
+                            source.lower(),
+                            ('OTHER', '#475569', '#cbd5e1')
+                        )
+                        src_label, bg_color, text_color = src_info
                         st.markdown(
-                            f"<span style='color:#8b949e; font-size:12px;'>{year}</span>",
+                            f"<span style='background:{bg_color}; "
+                            f"color:{text_color}; "
+                            f"padding:2px 7px; border-radius:4px; "
+                            f"font-size:11px; font-weight:bold;'>"
+                            f"{src_label}</span>",
                             unsafe_allow_html=True
                         )
                     
                     with c3:
-                        display_val = (
-                            str(citations) if citations
-                            else f"{score:.2f}"
-                        )
+                        # Citations or year as fallback
+                        display_val = str(citations) if citations else str(year)
                         st.markdown(
                             f"<span style='background:#21262d; color:#8b949e; "
-                            f"padding:2px 6px; border-radius:4px; "
+                            f"padding:2px 7px; border-radius:4px; "
                             f"font-size:11px;'>{display_val}</span>",
                             unsafe_allow_html=True
                         )
                     
                     with c4:
-                        if st.button(
-                            title[:70] + ("…" if len(title) > 70 else ""),
-                            key=f"paper_{idx}",
-                            use_container_width=True
-                        ):
-                            st.session_state.selected_paper_idx = (
-                                None if st.session_state.selected_paper_idx == idx
-                                else idx
+                        title_col, link_col = st.columns([10, 1])
+                        with title_col:
+                            if st.button(
+                                title[:70] + ("…" if len(title) > 70 else ""),
+                                key=f"paper_{idx}",
+                                use_container_width=True
+                            ):
+                                st.session_state.selected_paper_idx = (
+                                    None if st.session_state.selected_paper_idx == idx
+                                    else idx
+                                )
+                                st.rerun()
+                            
+                            st.markdown(
+                                f"<span style='color:#8b949e; font-size:11px;'>"
+                                f"{author_str}</span>",
+                                unsafe_allow_html=True
                             )
-                            st.rerun()
-                        
-                        st.markdown(
-                            f"<span style='color:#8b949e; font-size:11px;'>"
-                            f"{author_str}</span>",
-                            unsafe_allow_html=True
-                        )
-                    
-                    with c5:
-                        if url:
-                            st.link_button("↗", url)
+                        with link_col:
+                            if url:
+                                st.link_button("↗", url)
                     
                     # Abstract panel
                     if st.session_state.selected_paper_idx == idx:
@@ -653,15 +668,32 @@ with main_col:
             # TAB 4 — REPOSITORIES
             # ════════════════════════════
             with tab4:
-                with st.spinner("Finding related repositories..."):
-                    try:
+                # Check cache first
+                from utils.memory import save_repos, get_repos
+                
+                with st.spinner("Finding repositories..."):
+                    # Use LLM refined search terms for better results
+                    search_terms = result.get('search_terms', [])
+                    repo_query = (
+                        " ".join(search_terms[:2])
+                        if search_terms
+                        else result.get('query', '')
+                    )
+                    
+                    # Cache by original query
+                    cache_key = result.get('query', '')
+                    cached_repos = get_repos(cache_key)
+                    
+                    if cached_repos:
+                        repos = cached_repos
+                    else:
                         resources = get_related_resources(
-                            query=result.get('query', ''),
+                            query=repo_query,
                             max_repos=8
                         )
                         repos = resources.get('repos', [])
-                    except Exception:
-                        repos = []
+                        if repos:
+                            save_repos(cache_key, repos)
                 
                 if repos:
                     st.caption(f"{len(repos)} repositories found")

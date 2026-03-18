@@ -12,10 +12,12 @@ returns an empty list rather than raising an exception.
 """
 
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
+import fitz  # PyMuPDF
 import requests
 from bs4 import BeautifulSoup
 
@@ -30,6 +32,15 @@ ARXIV_SCRAPE_DELAY: float = 1.5         # seconds between page requests
 # ── Semantic Scholar scrape ────────────────────────────────────────────────
 SS_SEARCH_URL: str = "https://www.semanticscholar.org/search"
 SS_SCRAPE_DELAY: float = 2.0
+
+# ── Full-text extraction ──────────────────────────────────────────────────
+ARXIV_HTML_URL: str = "https://arxiv.org/html/{paper_id}"
+UNPAYWALL_URL: str  = "https://api.unpaywall.org/v2/{doi}"
+UNPAYWALL_EMAIL: str = "research.agent@example.com"
+FULLTEXT_MAX_CHARS: int = 15_000
+PDF_MAX_BYTES: int = 5 * 1024 * 1024      # 5 MB
+PDF_MAX_PAGES: int = 10
+ENRICH_DELAY: float = 1.0                 # seconds between papers
 
 # ── HTTP settings ────────────────────────────────────────────────────────
 REQUEST_TIMEOUT: int = 20               # seconds
@@ -328,6 +339,262 @@ def scrape_semantic_scholar(query: str, max_results: int = 10) -> List[Dict[str,
     return papers
 
 
+# ---------------------------------------------------------------------------
+# Full-text extraction helpers
+# ---------------------------------------------------------------------------
+
+def scrape_arxiv_fulltext(paper_id: str) -> str:
+    """
+    Scrape the full text of an arXiv paper from its HTML rendering.
+
+    Fetches ``https://arxiv.org/html/{paper_id}``, extracts the main
+    ``<article>`` body, strips navigation/figure/reference noise, and
+    returns up to :data:`FULLTEXT_MAX_CHARS` characters of clean prose.
+
+    Parameters
+    ----------
+    paper_id : str
+        arXiv paper ID (e.g. ``"2401.12345"`` or ``"2401.12345v2"``).
+
+    Returns
+    -------
+    str
+        Cleaned full text, or ``""`` on any failure.
+    """
+    if not paper_id or not str(paper_id).strip():
+        return ""
+    try:
+        url = ARXIV_HTML_URL.format(paper_id=str(paper_id).strip())
+        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, BS4_PARSER)
+
+        # Target the main article body
+        article = soup.find("article")
+        if not article:
+            logger.debug("scrape_arxiv_fulltext: no <article> tag found for '%s'.", paper_id)
+            return ""
+
+        # Remove noisy sub-trees
+        for tag in article.find_all(["nav", "header", "footer", "figure"]):
+            tag.decompose()
+
+        # Remove the references section (everything from first References heading)
+        for heading in article.find_all(re.compile(r"^h[1-6]$")):
+            if re.search(r"\bReferences\b", heading.get_text(), re.IGNORECASE):
+                for sibling in list(heading.find_next_siblings()):
+                    sibling.decompose()
+                heading.decompose()
+                break
+
+        text = article.get_text(separator=" ", strip=True)
+        # Collapse excessive whitespace
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = text.strip()
+
+        logger.info(
+            "scrape_arxiv_fulltext: extracted %d chars for paper '%s'.",
+            len(text), paper_id,
+        )
+        return text[:FULLTEXT_MAX_CHARS]
+
+    except Exception as exc:
+        logger.warning("scrape_arxiv_fulltext: failed for '%s' — %s", paper_id, exc)
+        return ""
+
+
+def download_and_extract_pdf(pdf_url: str) -> str:
+    """
+    Download a PDF from *pdf_url* and extract its text using PyMuPDF.
+
+    Only the first :data:`PDF_MAX_PAGES` pages are processed, and the
+    download is aborted if the response exceeds :data:`PDF_MAX_BYTES`.
+
+    Parameters
+    ----------
+    pdf_url : str
+        Direct URL to the PDF file.
+
+    Returns
+    -------
+    str
+        Extracted text (up to :data:`FULLTEXT_MAX_CHARS` chars),
+        or ``""`` on any failure.
+    """
+    if not pdf_url or not str(pdf_url).strip():
+        return ""
+    try:
+        resp = requests.get(
+            pdf_url,
+            headers=REQUEST_HEADERS,
+            timeout=30,
+            stream=True,
+        )
+        resp.raise_for_status()
+
+        # Stream download with size guard
+        chunks: List[bytes] = []
+        downloaded = 0
+        for chunk in resp.iter_content(chunk_size=65_536):
+            downloaded += len(chunk)
+            if downloaded > PDF_MAX_BYTES:
+                logger.warning(
+                    "download_and_extract_pdf: PDF exceeds %d MB limit, aborting '%s'.",
+                    PDF_MAX_BYTES // (1024 * 1024), pdf_url,
+                )
+                return ""
+            chunks.append(chunk)
+        pdf_bytes = b"".join(chunks)
+
+        # Extract text via PyMuPDF
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pages_text: List[str] = []
+        for page_num in range(min(len(doc), PDF_MAX_PAGES)):
+            try:
+                pages_text.append(doc[page_num].get_text())
+            except Exception:
+                continue
+        doc.close()
+
+        text = " ".join(pages_text)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+        logger.info(
+            "download_and_extract_pdf: extracted %d chars from '%s'.",
+            len(text), pdf_url,
+        )
+        return text[:FULLTEXT_MAX_CHARS]
+
+    except Exception as exc:
+        logger.warning("download_and_extract_pdf: failed for '%s' — %s", pdf_url, exc)
+        return ""
+
+
+def fetch_unpaywall(doi: str) -> str:
+    """
+    Attempt to retrieve the open-access PDF URL for a DOI via Unpaywall,
+    then extract its text.
+
+    Parameters
+    ----------
+    doi : str
+        Digital Object Identifier for the paper (e.g. ``"10.1234/example"``).
+
+    Returns
+    -------
+    str
+        Extracted full text, or ``""`` if no OA PDF is available or on failure.
+    """
+    if not doi or not str(doi).strip():
+        return ""
+    try:
+        url = UNPAYWALL_URL.format(doi=str(doi).strip())
+        resp = requests.get(
+            url,
+            params={"email": UNPAYWALL_EMAIL},
+            headers=REQUEST_HEADERS,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        best_oa = data.get("best_oa_location") or {}
+        pdf_url = str(best_oa.get("url_for_pdf") or "").strip()
+
+        if not pdf_url:
+            logger.debug("fetch_unpaywall: no PDF URL for DOI '%s'.", doi)
+            return ""
+
+        logger.info("fetch_unpaywall: found PDF for DOI '%s' at '%s'.", doi, pdf_url)
+        return download_and_extract_pdf(pdf_url)
+
+    except Exception as exc:
+        logger.warning("fetch_unpaywall: failed for DOI '%s' — %s", doi, exc)
+        return ""
+
+
+def enrich_papers_with_fulltext(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Attempt to attach full text to each paper dict in-place.
+
+    Strategy per paper
+    ------------------
+    1. **arXiv** papers with an ``id`` → :func:`scrape_arxiv_fulltext`.
+    2. Any paper with a ``doi`` field → :func:`fetch_unpaywall` (PDF).
+    3. **CORE** papers already containing ``full_text`` → marked directly.
+
+    Papers that cannot be enriched are returned unchanged with
+    ``content_type`` set to ``"abstract"``.
+
+    Parameters
+    ----------
+    papers : list of dict
+        Paper dicts from the fetcher / scraper pipeline.
+
+    Returns
+    -------
+    list of dict
+        Same list with ``full_text`` and ``content_type`` fields added.
+    """
+    total = len(papers)
+    enriched_count = 0
+
+    for i, paper in enumerate(papers):
+        source = str(paper.get("source", "")).lower()
+        got_fulltext = False
+
+        try:
+            # ── 1. arXiv HTML full text ───────────────────────────────────────
+            if "arxiv" in source and paper.get("id"):
+                ft = scrape_arxiv_fulltext(paper["id"])
+                if ft:
+                    paper["full_text"]    = ft
+                    paper["content_type"] = "full_text"
+                    got_fulltext = True
+
+            # ── 2. Unpaywall PDF (DOI-based) ────────────────────────────────
+            doi = str(paper.get("doi", "")).strip()
+            if doi and not got_fulltext:
+                ft = fetch_unpaywall(doi)
+                if ft:
+                    paper["full_text"]    = ft
+                    paper["content_type"] = "full_text"
+                    got_fulltext = True
+
+            # ── 3. CORE papers may already carry full_text ──────────────────
+            if source == "core" and paper.get("full_text"):
+                paper["content_type"] = "full_text"
+                got_fulltext = True
+
+        except Exception as exc:
+            logger.warning("enrich_papers_with_fulltext: error on paper %d — %s", i, exc)
+
+        # Default content type if nothing was found
+        if not got_fulltext:
+            paper.setdefault("content_type", "abstract")
+        else:
+            enriched_count += 1
+
+        logger.info(
+            "enrich_papers_with_fulltext: enriched %d/%d papers.",
+            enriched_count, total,
+        )
+        if i < total - 1:           # skip delay after last paper
+            time.sleep(ENRICH_DELAY)
+
+    logger.info(
+        "enrich_papers_with_fulltext: complete — %d/%d papers have full text.",
+        enriched_count, total,
+    )
+    return papers
+
+
+# ---------------------------------------------------------------------------
+# Existing public API (kept intact)
+# ---------------------------------------------------------------------------
+
 def scrape_papers(query: str, max_results: int = 10) -> List[Dict[str, Any]]:
     """
     Fallback scraping entry-point for the Research Assistant Agent.
@@ -372,4 +639,8 @@ def scrape_papers(query: str, max_results: int = 10) -> List[Dict[str, Any]]:
         "scrape_papers: total scraped = %d (arXiv=%d, SemanticScholar=%d).",
         len(combined), len(arxiv_results), len(ss_results),
     )
+
+    # Full text enrichment disabled
+    # arXiv HTML only exists for recent papers
+    # causing 404 errors for older papers
     return combined
