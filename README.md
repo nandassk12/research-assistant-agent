@@ -3,6 +3,7 @@
 > An AI-powered academic research pipeline that autonomously fetches, ranks, deduplicates, embeds, and summarizes scientific papers — with a conversational chatbot grounded in retrieved literature.
 
 ---
+![](./assets/UI_paper.png)
 
 ## Overview
 
@@ -47,7 +48,38 @@ research-assistant-agent/
 ├── docker-compose.yml
 └── Dockerfile
 ```
+## 🧠 System Architecture
 
+This project follows a multi-stage AI pipeline combining NLP, machine learning, and LLM-based reasoning.
+
+### High-Level Architecture
+
+![Architecture Diagram](./Architecture_RP.png)
+
+### Overview
+
+The system is designed as a hybrid intelligence pipeline with the following stages:
+
+- **Input Layer** → Accepts user query or document input  
+- **NLP Processing** → Extracts keywords using spaCy and KeyBERT  
+- **LLM Validation** → Refines keywords using Groq (LLaMA 3.3)  
+- **Agent Controller** → Routes queries to multiple research sources  
+- **Multi-Source Retrieval** → arXiv, Semantic Scholar, OpenAlex, CORE, PubMed  
+- **Data Processing** → Deduplication + TF-IDF ranking  
+- **Full-Text Enrichment** → Extracts additional content from papers  
+- **Vector Storage** → Embeddings stored in ChromaDB  
+- **RAG Pipeline** → Retrieves relevant chunks  
+- **LLM Synthesis** → Generates structured research report  
+- **Application Layer** → Streamlit UI + Chatbot + Insights  
+- **Output Layer** → Reports, analytics, PDF export  
+
+### Key Design Highlights
+
+- Hybrid AI system (ML + LLM)
+- Multi-source academic retrieval
+- Retrieval-Augmented Generation (RAG)
+- Persistent memory (ChromaDB + SQLite)
+- Modular agent-based architecture
 ---
 
 ## Progress & Changelog
