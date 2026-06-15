@@ -136,6 +136,7 @@ Phase 3 was the biggest push — expanding from 2 paper sources to 5, adding ful
 
 ## Architecture & Workflow
 
+![System Architecture](assets/Architecture_RP.png)
 
 ## Core ML Techniques & AI Stack
 
