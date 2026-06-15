@@ -8,3 +8,4 @@ venv/
 research_memory.db 
 search_history.txt 
 test_file.py 
+.vscode/
